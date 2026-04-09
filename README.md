@@ -53,8 +53,6 @@ This project is **not affiliated with, endorsed by, or supported by** Streamer.b
 It is an independent project built from personal experimentation with MCP.  
 Use at your own discretion.
 
----
-
 ## 🔧 Status
 
 Active development — improvements and refinements ongoing.
