@@ -8,7 +8,7 @@ This extension allows Streamer.bot to execute Stream Deck actions by leveraging 
 
 ## ✨ Features
 
-- Trigger Stream Deck buttons using Streamer.bot — including plugin actions
+- Trigger Stream Deck buttons using Streamer.bot, including plugin actions
 - Extend Streamer.bot beyond its native action features
 - Works with your existing Stream Deck setup
 
