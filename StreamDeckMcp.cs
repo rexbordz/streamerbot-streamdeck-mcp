@@ -7,6 +7,7 @@ using Newtonsoft.Json.Linq;
 using System.Threading;
 using System.Linq;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 
 
 public class CPHInline
@@ -17,6 +18,12 @@ public class CPHInline
 	private string _mcpSessionId;
 	private const string McpUrl = "http://127.0.0.1:9090/mcp";
 	private Dictionary<string, string> _actions = new Dictionary<string, string>();
+	private const string SdKeyRegistryGlobal = "[SD MCP] ActionKeys";
+
+	private IntPtr _mcpJobHandle = IntPtr.Zero;
+
+	private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+	private const int JobObjectExtendedLimitInformation = 9;
     
     public bool Execute()
 	{
@@ -41,81 +48,17 @@ public class CPHInline
 	public void Dispose()
 	{
 		StopElgatoMcpServer();
+
+		if (_mcpJobHandle != IntPtr.Zero)
+		{
+			CloseHandle(_mcpJobHandle);
+			_mcpJobHandle = IntPtr.Zero;
+		}
 	}
 
 	/********************
 	* EXECUTABLE METHODS
 	*********************/
-	private bool InitializeMcpSession()
-	{
-		using (var client = new HttpClient())
-		{
-			client.Timeout = TimeSpan.FromSeconds(5);
-
-			for (int attempt = 0; attempt < 15; attempt++)
-			{
-				try
-				{
-					client.DefaultRequestHeaders.Clear();
-					client.DefaultRequestHeaders.Add("Accept", "application/json, text/event-stream");
-
-					string initializeJson =
-						"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"Streamer.bot\",\"version\":\"1.0.0\"}}}";
-
-					var initContent = new StringContent(initializeJson, Encoding.UTF8, "application/json");
-					var initResponse = client.PostAsync(McpUrl, initContent).Result;
-
-					if (!initResponse.IsSuccessStatusCode)
-					{
-						Thread.Sleep(1000);
-						continue;
-					}
-
-					if (!initResponse.Headers.Contains("mcp-session-id"))
-					{
-						CPH.LogWarn("[ElgatoMCP][Init] Initialize response missing mcp-session-id header.");
-						Thread.Sleep(1000);
-						continue;
-					}
-
-					_mcpSessionId = initResponse.Headers.GetValues("mcp-session-id").FirstOrDefault();
-
-					if (string.IsNullOrWhiteSpace(_mcpSessionId))
-					{
-						CPH.LogWarn("[ElgatoMCP][Init] MCP session ID was empty.");
-						Thread.Sleep(1000);
-						continue;
-					}
-
-					client.DefaultRequestHeaders.Clear();
-					client.DefaultRequestHeaders.Add("Accept", "application/json, text/event-stream");
-					client.DefaultRequestHeaders.Add("Mcp-Session-Id", _mcpSessionId);
-
-					string initializedJson =
-						"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
-
-					var initializedContent = new StringContent(initializedJson, Encoding.UTF8, "application/json");
-					var initializedResponse = client.PostAsync(McpUrl, initializedContent).Result;
-
-					if ((int)initializedResponse.StatusCode == 202 || initializedResponse.IsSuccessStatusCode)
-					{
-						CPH.LogInfo($"[ElgatoMCP][Init] MCP session initialized. SessionId={_mcpSessionId}");
-						return true;
-					}
-
-					CPH.LogWarn($"[ElgatoMCP][Init] notifications/initialized failed with status {(int)initializedResponse.StatusCode}.");
-				}
-				catch (Exception ex)
-				{
-					CPH.LogWarn($"[ElgatoMCP][Init] Attempt {attempt + 1} failed: {ex.Message}");
-				}
-
-				Thread.Sleep(1000);
-			}
-		}
-
-		return false;
-	}
 
 	public bool RefreshExecutableActions()
 	{
@@ -174,6 +117,9 @@ public class CPHInline
 
 				_actions.Clear();
 
+				var currentGlobalKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+				var unnamedActionCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
 				foreach (var action in actions)
 				{
 					string title = action["title"]?.ToString();
@@ -198,21 +144,31 @@ public class CPHInline
 						if (string.IsNullOrWhiteSpace(actionName))
 							actionName = "UnknownAction";
 
-						int index = 1;
-						globalKey = $"[SD] {pluginId} {actionName}_{index}";
+						string unnamedBaseKey = $"{pluginId} {actionName}";
 
-						while (CPH.GetGlobalVar<string>(globalKey, false) != null)
-						{
-							index++;
-							globalKey = $"[SD] {pluginId} {actionName}_{index}";
-						}
+						int index;
+						if (!unnamedActionCounts.TryGetValue(unnamedBaseKey, out index))
+							index = 0;
+
+						index++;
+						unnamedActionCounts[unnamedBaseKey] = index;
+
+						globalKey = $"[SD] {unnamedBaseKey}_{index}";
 					}
 
-					_actions[title ?? globalKey] = id;
+					string actionLookupName = !string.IsNullOrWhiteSpace(title)
+						? title
+						: globalKey.Substring(5);
+
+					_actions[actionLookupName] = id;
 					CPH.SetGlobalVar(globalKey, id, false);
+					currentGlobalKeys.Add(globalKey);
 
 					CPH.LogInfo($"[ElgatoMCP][Actions] {globalKey} → {id}");
 				}
+
+				RemoveDeletedStreamDeckGlobals(currentGlobalKeys);
+				SaveStreamDeckGlobalRegistry(currentGlobalKeys);
 
 				CPH.LogInfo($"[ElgatoMCP][Actions] Loaded {_actions.Count} actions.");
 
@@ -323,34 +279,213 @@ public class CPHInline
 	* PROCESS METHODS
 	******************/
 
+	private bool InitializeMcpSession()
+	{
+		using (var client = new HttpClient())
+		{
+			client.Timeout = TimeSpan.FromSeconds(5);
+
+			for (int attempt = 0; attempt < 15; attempt++)
+			{
+				try
+				{
+					client.DefaultRequestHeaders.Clear();
+					client.DefaultRequestHeaders.Add("Accept", "application/json, text/event-stream");
+
+					string initializeJson =
+						"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"Streamer.bot\",\"version\":\"1.0.0\"}}}";
+
+					var initContent = new StringContent(initializeJson, Encoding.UTF8, "application/json");
+					var initResponse = client.PostAsync(McpUrl, initContent).Result;
+
+					if (!initResponse.IsSuccessStatusCode)
+					{
+						Thread.Sleep(1000);
+						continue;
+					}
+
+					if (!initResponse.Headers.Contains("mcp-session-id"))
+					{
+						CPH.LogWarn("[ElgatoMCP][Init] Initialize response missing mcp-session-id header.");
+						Thread.Sleep(1000);
+						continue;
+					}
+
+					_mcpSessionId = initResponse.Headers.GetValues("mcp-session-id").FirstOrDefault();
+
+					if (string.IsNullOrWhiteSpace(_mcpSessionId))
+					{
+						CPH.LogWarn("[ElgatoMCP][Init] MCP session ID was empty.");
+						Thread.Sleep(1000);
+						continue;
+					}
+
+					client.DefaultRequestHeaders.Clear();
+					client.DefaultRequestHeaders.Add("Accept", "application/json, text/event-stream");
+					client.DefaultRequestHeaders.Add("Mcp-Session-Id", _mcpSessionId);
+
+					string initializedJson =
+						"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}";
+
+					var initializedContent = new StringContent(initializedJson, Encoding.UTF8, "application/json");
+					var initializedResponse = client.PostAsync(McpUrl, initializedContent).Result;
+
+					if ((int)initializedResponse.StatusCode == 202 || initializedResponse.IsSuccessStatusCode)
+					{
+						CPH.LogInfo($"[ElgatoMCP][Init] MCP session initialized. SessionId={_mcpSessionId}");
+						return true;
+					}
+
+					CPH.LogWarn($"[ElgatoMCP][Init] notifications/initialized failed with status {(int)initializedResponse.StatusCode}.");
+				}
+				catch (Exception ex)
+				{
+					var baseEx = ex.GetBaseException();
+					CPH.LogWarn($"[ElgatoMCP][Init] Attempt {attempt + 1} failed: {baseEx.GetType().Name}: {baseEx.Message}");
+				}
+
+				Thread.Sleep(1000);
+			}
+		}
+
+		return false;
+	}
+
+	// --- MCP SERVER PROCESS KILLER ---
+	// This section is responsible for automatically killing the server when it detects that the parent app isn't running anymore
+	// This avoids stale connection to the old Streamer.bot instance in case Streamer.bot crashed or was forced closed
+	[DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+	private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
+
+	[DllImport("kernel32.dll")]
+	private static extern bool SetInformationJobObject(
+		IntPtr hJob,
+		int jobObjectInfoClass,
+		IntPtr lpJobObjectInfo,
+		uint cbJobObjectInfoLength
+	);
+
+	[DllImport("kernel32.dll", SetLastError = true)]
+	private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+	[DllImport("kernel32.dll", SetLastError = true)]
+	private static extern bool CloseHandle(IntPtr hObject);
+
+	[StructLayout(LayoutKind.Sequential)]
+	private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+	{
+		public long PerProcessUserTimeLimit;
+		public long PerJobUserTimeLimit;
+		public uint LimitFlags;
+		public UIntPtr MinimumWorkingSetSize;
+		public UIntPtr MaximumWorkingSetSize;
+		public uint ActiveProcessLimit;
+		public IntPtr Affinity;
+		public uint PriorityClass;
+		public uint SchedulingClass;
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
+	private struct IO_COUNTERS
+	{
+		public ulong ReadOperationCount;
+		public ulong WriteOperationCount;
+		public ulong OtherOperationCount;
+		public ulong ReadTransferCount;
+		public ulong WriteTransferCount;
+		public ulong OtherTransferCount;
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
+	private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	{
+		public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+		public IO_COUNTERS IoInfo;
+		public UIntPtr ProcessMemoryLimit;
+		public UIntPtr JobMemoryLimit;
+		public UIntPtr PeakProcessMemoryUsed;
+		public UIntPtr PeakJobMemoryUsed;
+	}
+
+	private bool AssignProcessToKillOnCloseJob(Process process)
+	{
+		try
+		{
+			if (process == null || process.HasExited)
+				return false;
+
+			if (_mcpJobHandle == IntPtr.Zero)
+			{
+				_mcpJobHandle = CreateJobObject(IntPtr.Zero, null);
+
+				if (_mcpJobHandle == IntPtr.Zero)
+				{
+					CPH.LogWarn("[ElgatoMCP][Init] Failed to create MCP job object.");
+					return false;
+				}
+
+				var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+				info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+				int length = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+				IntPtr infoPtr = Marshal.AllocHGlobal(length);
+
+				try
+				{
+					Marshal.StructureToPtr(info, infoPtr, false);
+
+					if (!SetInformationJobObject(_mcpJobHandle, JobObjectExtendedLimitInformation, infoPtr, (uint)length))
+					{
+						int error = Marshal.GetLastWin32Error();
+						CPH.LogWarn($"[ElgatoMCP][Init] Failed to configure MCP job object. Win32Error={error}");
+						return false;
+					}
+				}
+				finally
+				{
+					Marshal.FreeHGlobal(infoPtr);
+				}
+			}
+
+			if (!AssignProcessToJobObject(_mcpJobHandle, process.Handle))
+			{
+				int error = Marshal.GetLastWin32Error();
+				CPH.LogWarn($"[ElgatoMCP][Init] Failed to assign MCP process to job object. Win32Error={error}");
+				return false;
+			}
+
+			CPH.LogInfo("[ElgatoMCP][Init] MCP process assigned to kill-on-close job object.");
+			return true;
+		}
+		catch (Exception ex)
+		{
+			CPH.LogWarn($"[ElgatoMCP][Init] Job object setup failed: {ex.GetType().Name}: {ex.Message}");
+			return false;
+		}
+	}
+	// --- END SECTION ---
+
 	private void LaunchElgatoMcpServer()
 	{
 		try
 		{
-			string batPath = Path.Combine(rootDir, "ElgatoMcpBridge", "start-mcp.bat");
-
-			if (!File.Exists(batPath))
-			{
-				CPH.LogWarn($"[ElgatoMCP][Init] Launch skipped: file not found at '{batPath}'");
-				return;
-			}
-
 			var startInfo = new ProcessStartInfo
 			{
 				FileName = "cmd.exe",
-				Arguments = $"/c \"{batPath}\"",
-				WorkingDirectory = Path.GetDirectoryName(batPath),
+				Arguments = "/c npx -y @elgato/mcp-server@latest --http",
 				UseShellExecute = false,
 				CreateNoWindow = true
 			};
 
 			_elgatoMcpProcess = Process.Start(startInfo);
 
-			CPH.LogInfo($"[ElgatoMCP][Init] Launch attempted: '{batPath}'");
+			AssignProcessToKillOnCloseJob(_elgatoMcpProcess);
+
+			CPH.LogInfo($"[ElgatoMCP][Init] Launch attempted (PID={_elgatoMcpProcess?.Id}).");
 		}
 		catch (Exception ex)
 		{
-			CPH.LogWarn($"[ElgatoMCP][Init] Launch failed: {ex.Message}");
+			CPH.LogWarn($"[ElgatoMCP][Init] Launch failed: {ex.GetType().Name}: {ex.Message}");
 		}
 	}
 
@@ -385,6 +520,66 @@ public class CPHInline
 	/****************
 	* HELPER METHODS
 	*****************/
+
+	private void RemoveDeletedStreamDeckGlobals(HashSet<string> currentGlobalKeys)
+	{
+		try
+		{
+			var previousKeys = LoadStreamDeckGlobalRegistry();
+
+			foreach (string oldKey in previousKeys)
+			{
+				if (currentGlobalKeys.Contains(oldKey))
+					continue;
+
+				CPH.UnsetGlobalVar(oldKey, false);
+				CPH.LogInfo($"[ElgatoMCP][Refresh] Removed stale Stream Deck global: {oldKey}");
+			}
+		}
+		catch (Exception ex)
+		{
+			CPH.LogWarn($"[ElgatoMCP][Refresh] Failed to remove stale globals: {ex.GetType().Name}: {ex.Message}");
+		}
+	}
+
+	private HashSet<string> LoadStreamDeckGlobalRegistry()
+	{
+		var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+		string json = CPH.GetGlobalVar<string>(SdKeyRegistryGlobal, false);
+
+		if (string.IsNullOrWhiteSpace(json))
+			return keys;
+
+		try
+		{
+			var array = JArray.Parse(json);
+
+			foreach (var item in array)
+			{
+				string key = item?.ToString();
+
+				if (!string.IsNullOrWhiteSpace(key))
+					keys.Add(key);
+			}
+		}
+		catch
+		{
+			// If the registry is corrupted, ignore it and rebuild on this refresh.
+		}
+
+		return keys;
+	}
+
+	private void SaveStreamDeckGlobalRegistry(HashSet<string> currentGlobalKeys)
+	{
+		var array = new JArray();
+
+		foreach (string key in currentGlobalKeys.OrderBy(k => k, StringComparer.OrdinalIgnoreCase))
+			array.Add(key);
+
+		CPH.SetGlobalVar(SdKeyRegistryGlobal, array.ToString(Newtonsoft.Json.Formatting.None), false);
+	}
 
 	private string SanitizeKey(string input)
 	{
