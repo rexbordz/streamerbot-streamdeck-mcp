@@ -15,6 +15,7 @@ This extension allows Streamer.bot to execute Stream Deck actions by leveraging 
 
 - **Stream Deck 7.4.0+** (MCP required)
 - **Node.js** (required for MCP integrations)
+- [**rexbordzUI**](https://github.com/rexbordz/rexbordzUI/releases/tag/v1.0.0) (Optional but highly recommended for Update Notifications)
 
 👉 MCP setup guide:  
 https://www.elgato.com/us/en/explorer/products/stream-deck/sd-mcp-setup/
