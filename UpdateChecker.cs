@@ -15,7 +15,7 @@ public class CPHInline
             {
                 await checker.CheckForUpdate(
                     widgetTitle,               
-                    "1.0.0",                         
+                    "1.0.1",                         
                     "https://raw.githubusercontent.com/rexbordz/streamerbot-streamdeck-mcp/refs/heads/main/version.json"  // JSON URL
                 );
             });

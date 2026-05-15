@@ -29,7 +29,8 @@ public class CPHInline
 	{
 		LaunchElgatoMcpServer();
 
-		if (!InitializeMcpSession())
+		InitializeMcpSession(out bool sessionOk);
+		if (!sessionOk)
 		{
 			CPH.LogWarn("[ElgatoMCP][Init] MCP session initialization failed.");
 		}
@@ -59,97 +60,27 @@ public class CPHInline
 	/********************
 	* EXECUTABLE METHODS
 	*********************/
+
 	public bool ExecuteMcpAction()
 	{
-		CPH.TryGetArg("actionInput", out string actionInput);
+		TryExecuteMcpAction(out bool executed);
+		if (executed) return true;
 
-		try
+		// ELSE - in case the MCP action wasn't executed successfully, which is usually caused by
+		// expired sessionId, reinitialize another session and retry executing the MCP action
+		CPH.LogWarn("[ElgatoMCP][Execute] Execute failed. Reinitializing MCP session and retrying once.");
+
+		InitializeMcpSession(out bool reinitialized);
+		if (!reinitialized)
 		{
-			if (string.IsNullOrWhiteSpace(actionInput))
-			{
-				CPH.LogWarn("[ElgatoMCP][Execute] Action input was empty.");
-				return false;
-			}
-
-			if (string.IsNullOrWhiteSpace(_mcpSessionId))
-			{
-				_mcpSessionId = CPH.GetGlobalVar<string>("[SD MCP] SessionId", false);
-			}
-
-			if (string.IsNullOrWhiteSpace(_mcpSessionId))
-			{
-				CPH.LogWarn("[ElgatoMCP][Execute] MCP session ID was not available.");
-				return false;
-			}
-
-			string resolvedId = ResolveActionId(actionInput);
-
-			if (string.IsNullOrWhiteSpace(resolvedId))
-			{
-				CPH.LogWarn($"[ElgatoMCP][Execute] Could not resolve action: '{actionInput}'");
-				return false;
-			}
-
-			using (var client = new HttpClient())
-			{
-				client.Timeout = TimeSpan.FromSeconds(5);
-
-				client.DefaultRequestHeaders.Clear();
-				client.DefaultRequestHeaders.Add("Accept", "application/json, text/event-stream");
-				client.DefaultRequestHeaders.Add("Mcp-Session-Id", _mcpSessionId);
-
-				string escapedId = EscapeJson(resolvedId);
-
-				string requestJson =
-					"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"streamdeck__execute_action\",\"arguments\":{\"id\":\"" + escapedId + "\"}}}";
-
-				var content = new StringContent(requestJson, Encoding.UTF8, "application/json");
-				var response = client.PostAsync(McpUrl, content).Result;
-
-				if (!response.IsSuccessStatusCode)
-				{
-					CPH.LogWarn($"[ElgatoMCP][Execute] Request failed with status {(int)response.StatusCode}");
-					return false;
-				}
-
-				string raw = response.Content.ReadAsStringAsync().Result;
-
-				int dataIndex = raw.IndexOf("data:");
-				if (dataIndex == -1)
-				{
-					CPH.LogWarn("[ElgatoMCP][Execute] Could not find data payload.");
-					return false;
-				}
-
-				string jsonPart = raw.Substring(dataIndex + 5).Trim();
-				var outer = JObject.Parse(jsonPart);
-
-				string textContent = outer["result"]?["content"]?[0]?["text"]?.ToString();
-
-				if (string.IsNullOrWhiteSpace(textContent))
-				{
-					CPH.LogWarn("[ElgatoMCP][Execute] Empty result content.");
-					return false;
-				}
-
-				var inner = JObject.Parse(textContent);
-				string status = inner["status"]?.ToString();
-
-				if (string.Equals(status, "ok", StringComparison.OrdinalIgnoreCase))
-				{
-					CPH.LogDebug($"[ElgatoMCP][Execute] Executed action '{actionInput}' -> '{resolvedId}'.");
-					return true;
-				}
-
-				CPH.LogWarn($"[ElgatoMCP][Execute] Unexpected status for '{actionInput}': {textContent}");
-				return false;
-			}
-		}
-		catch (Exception ex)
-		{
-			CPH.LogWarn($"[ElgatoMCP][Execute] Failed for '{actionInput}': {ex.Message}");
+			CPH.LogWarn("[ElgatoMCP][Execute] Failed to reinitialize MCP session.");
 			return false;
 		}
+
+		CPH.SetGlobalVar("[SD MCP] SessionId", _mcpSessionId, false);
+
+		TryExecuteMcpAction(out bool retried);
+		return retried;
 	}
 
 	public bool RefreshExecutableActions()
@@ -278,7 +209,7 @@ public class CPHInline
 	* PROCESS METHODS
 	******************/
 
-	private bool InitializeMcpSession()
+	private void InitializeMcpSession(out bool success)
 	{
 		using (var client = new HttpClient())
 		{
@@ -332,7 +263,8 @@ public class CPHInline
 					if ((int)initializedResponse.StatusCode == 202 || initializedResponse.IsSuccessStatusCode)
 					{
 						CPH.LogInfo($"[ElgatoMCP][Init] MCP session initialized. SessionId={_mcpSessionId}");
-						return true;
+						success = true;
+						return;
 					}
 
 					CPH.LogWarn($"[ElgatoMCP][Init] notifications/initialized failed with status {(int)initializedResponse.StatusCode}.");
@@ -347,7 +279,110 @@ public class CPHInline
 			}
 		}
 
-		return false;
+		success = false;
+		return;
+	}
+
+	private void TryExecuteMcpAction(out bool success)
+	{
+		CPH.TryGetArg("actionInput", out string actionInput);
+
+		try
+		{
+			if (string.IsNullOrWhiteSpace(actionInput))
+			{
+				CPH.LogWarn("[ElgatoMCP][Execute] Action input was empty.");
+				success = false;
+				return;
+			}
+
+			if (string.IsNullOrWhiteSpace(_mcpSessionId))
+			{
+				_mcpSessionId = CPH.GetGlobalVar<string>("[SD MCP] SessionId", false);
+			}
+
+			if (string.IsNullOrWhiteSpace(_mcpSessionId))
+			{
+				CPH.LogWarn("[ElgatoMCP][Execute] MCP session ID was not available.");
+				success = false;
+				return;
+			}
+
+			string resolvedId = ResolveActionId(actionInput);
+
+			if (string.IsNullOrWhiteSpace(resolvedId))
+			{
+				CPH.LogWarn($"[ElgatoMCP][Execute] Could not resolve action: '{actionInput}'");
+				success = false;
+				return;
+			}
+
+			using (var client = new HttpClient())
+			{
+				client.Timeout = TimeSpan.FromSeconds(5);
+
+				client.DefaultRequestHeaders.Clear();
+				client.DefaultRequestHeaders.Add("Accept", "application/json, text/event-stream");
+				client.DefaultRequestHeaders.Add("Mcp-Session-Id", _mcpSessionId);
+
+				string escapedId = EscapeJson(resolvedId);
+
+				string requestJson =
+					"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"streamdeck__execute_action\",\"arguments\":{\"id\":\"" + escapedId + "\"}}}";
+
+				var content = new StringContent(requestJson, Encoding.UTF8, "application/json");
+				var response = client.PostAsync(McpUrl, content).Result;
+
+				if (!response.IsSuccessStatusCode)
+				{
+					CPH.LogWarn($"[ElgatoMCP][Execute] Request failed with status {(int)response.StatusCode}");
+					success = false;
+					return;
+				}
+
+				string raw = response.Content.ReadAsStringAsync().Result;
+
+				int dataIndex = raw.IndexOf("data:");
+				if (dataIndex == -1)
+				{
+					CPH.LogWarn("[ElgatoMCP][Execute] Could not find data payload.");
+					success = false;
+					return;
+				}
+
+				string jsonPart = raw.Substring(dataIndex + 5).Trim();
+				var outer = JObject.Parse(jsonPart);
+
+				string textContent = outer["result"]?["content"]?[0]?["text"]?.ToString();
+
+				if (string.IsNullOrWhiteSpace(textContent))
+				{
+					CPH.LogWarn("[ElgatoMCP][Execute] Empty result content.");
+					success = false;
+					return;
+				}
+
+				var inner = JObject.Parse(textContent);
+				string status = inner["status"]?.ToString();
+
+				if (string.Equals(status, "ok", StringComparison.OrdinalIgnoreCase))
+				{
+					CPH.LogDebug($"[ElgatoMCP][Execute] Executed action '{actionInput}' -> '{resolvedId}'.");
+					success = true;
+					return;
+				}
+
+				CPH.LogWarn($"[ElgatoMCP][Execute] Unexpected status for '{actionInput}': {textContent}");
+				success = false;
+				return;
+			}
+		}
+		catch (Exception ex)
+		{
+			CPH.LogWarn($"[ElgatoMCP][Execute] Failed for '{actionInput}': {ex.Message}");
+			success = false;
+			return;
+		}
 	}
 
 	// --- MCP SERVER PROCESS KILLER ---

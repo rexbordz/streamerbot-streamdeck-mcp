@@ -1,10 +1,12 @@
 {
   "name": "Stream Deck MCP",
-  "latestVersion": "1.0.0",
+  "latestVersion": "1.0.1",
   "changelog": [
-    "Fixed Streamer.bot not connecting to websocket after it crashes/gets forced closed due to a stale connection that MCP server script leaves for being connected to the old Streamer.bot instance",
-    "Fixed global variable duplications when executing RefreshExecutableActions method",
-    "Added unsetting global variables for the buttons that have been deleted in the MCP Actions page"
+    "Fixed Stream Deck MCP actions stopping after long idle periods",
+    "Improved MCP session recovery after idle periods",
+    "Added automatic MCP session reinitialization on execution failure",
+    "Improved reliability of Stream Deck MCP action execution over long runtimes",
+    "Removed InitializeMcpSession() method as a Stream Deck MCP Execute C# Method dropdown option"
   ],
   "downloadUrl": "https://github.com/rexbordz/streamerbot-streamdeck-mcp/blob/main/import.sb"
 }
